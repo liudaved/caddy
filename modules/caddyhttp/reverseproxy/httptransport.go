@@ -19,18 +19,27 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	weakrand "math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/modules/caddytls"
+	"github.com/pires/go-proxyproto"
+	"github.com/quic-go/quic-go/http3"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http2"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddytls"
 )
 
 func init() {
@@ -63,6 +72,26 @@ type HTTPTransport struct {
 	// Maximum number of connections per host. Default: 0 (no limit)
 	MaxConnsPerHost int `json:"max_conns_per_host,omitempty"`
 
+	// If non-empty, which PROXY protocol version to send when
+	// connecting to an upstream. Default: off.
+	ProxyProtocol string `json:"proxy_protocol,omitempty"`
+
+	// URL to the server that the HTTP transport will use to proxy
+	// requests to the upstream. See http.Transport.Proxy for
+	// information regarding supported protocols. This value takes
+	// precedence over `HTTP_PROXY`, etc.
+	//
+	// Providing a value to this parameter results in
+	// requests flowing through the reverse_proxy in the following
+	// way:
+	//
+	// User Agent ->
+	//  reverse_proxy ->
+	//  forward_proxy_url -> upstream
+	//
+	// Default: http.ProxyFromEnvironment
+	ForwardProxyURL string `json:"forward_proxy_url,omitempty"`
+
 	// How long to wait before timing out trying to connect to
 	// an upstream. Default: `3s`.
 	DialTimeout caddy.Duration `json:"dial_timeout,omitempty"`
@@ -88,16 +117,32 @@ type HTTPTransport struct {
 	// The size of the read buffer in bytes. Default: `4KiB`.
 	ReadBufferSize int `json:"read_buffer_size,omitempty"`
 
+	// The maximum time to wait for next read from backend. Default: no timeout.
+	ReadTimeout caddy.Duration `json:"read_timeout,omitempty"`
+
+	// The maximum time to wait for next write to backend. Default: no timeout.
+	WriteTimeout caddy.Duration `json:"write_timeout,omitempty"`
+
 	// The versions of HTTP to support. As a special case, "h2c"
 	// can be specified to use H2C (HTTP/2 over Cleartext) to the
 	// upstream (this feature is experimental and subject to
 	// change or removal). Default: ["1.1", "2"]
+	//
+	// EXPERIMENTAL: "3" enables HTTP/3, but it must be the only
+	// version specified if enabled. Additionally, HTTPS must be
+	// enabled to the upstream as HTTP/3 requires TLS. Subject
+	// to change or removal while experimental.
 	Versions []string `json:"versions,omitempty"`
+
+	// Specify the address to bind to when connecting to an upstream. In other words,
+	// it is the address the upstream sees as the remote address.
+	LocalAddress string `json:"local_address,omitempty"`
 
 	// The pre-configured underlying HTTP transport.
 	Transport *http.Transport `json:"-"`
 
 	h2cTransport *http2.Transport
+	h3Transport  *http3.Transport // TODO: EXPERIMENTAL (May 2024)
 }
 
 // CaddyModule returns the Caddy module information.
@@ -121,33 +166,11 @@ func (h *HTTPTransport) Provision(ctx caddy.Context) error {
 	}
 	h.Transport = rt
 
-	// if h2c is enabled, configure its transport (std lib http.Transport
-	// does not "HTTP/2 over cleartext TCP")
-	if sliceContains(h.Versions, "h2c") {
-		// crafting our own http2.Transport doesn't allow us to utilize
-		// most of the customizations/preferences on the http.Transport,
-		// because, for some reason, only http2.ConfigureTransport()
-		// is allowed to set the unexported field that refers to a base
-		// http.Transport config; oh well
-		h2t := &http2.Transport{
-			// kind of a hack, but for plaintext/H2C requests, pretend to dial TLS
-			DialTLS: func(network, addr string, _ *tls.Config) (net.Conn, error) {
-				// TODO: no context, thus potentially wrong dial info
-				return net.Dial(network, addr)
-			},
-			AllowHTTP: true,
-		}
-		if h.Compression != nil {
-			h2t.DisableCompression = !*h.Compression
-		}
-		h.h2cTransport = h2t
-	}
-
 	return nil
 }
 
 // NewTransport builds a standard-lib-compatible http.Transport value from h.
-func (h *HTTPTransport) NewTransport(ctx caddy.Context) (*http.Transport, error) {
+func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, error) {
 	// Set keep-alive defaults if it wasn't otherwise configured
 	if h.KeepAlive == nil {
 		h.KeepAlive = &KeepAlive{
@@ -168,6 +191,31 @@ func (h *HTTPTransport) NewTransport(ctx caddy.Context) (*http.Transport, error)
 		FallbackDelay: time.Duration(h.FallbackDelay),
 	}
 
+	if h.LocalAddress != "" {
+		netaddr, err := caddy.ParseNetworkAddressWithDefaults(h.LocalAddress, "tcp", 0)
+		if err != nil {
+			return nil, err
+		}
+		if netaddr.PortRangeSize() > 1 {
+			return nil, fmt.Errorf("local_address must be a single address, not a port range")
+		}
+		switch netaddr.Network {
+		case "tcp", "tcp4", "tcp6":
+			dialer.LocalAddr, err = net.ResolveTCPAddr(netaddr.Network, netaddr.JoinHostPort(0))
+			if err != nil {
+				return nil, err
+			}
+		case "unix", "unixgram", "unixpacket":
+			dialer.LocalAddr, err = net.ResolveUnixAddr(netaddr.Network, netaddr.JoinHostPort(0))
+			if err != nil {
+				return nil, err
+			}
+		case "udp", "udp4", "udp6":
+			return nil, fmt.Errorf("local_address must be a TCP address, not a UDP address")
+		default:
+			return nil, fmt.Errorf("unsupported network")
+		}
+	}
 	if h.Resolver != nil {
 		err := h.Resolver.ParseAddresses()
 		if err != nil {
@@ -187,22 +235,114 @@ func (h *HTTPTransport) NewTransport(ctx caddy.Context) (*http.Transport, error)
 		}
 	}
 
-	rt := &http.Transport{
-		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			// the proper dialing information should be embedded into the request's context
-			if dialInfo, ok := GetDialInfo(ctx); ok {
+	dialContext := func(ctx context.Context, network, address string) (net.Conn, error) {
+		// For unix socket upstreams, we need to recover the dial info from
+		// the request's context, because the Host on the request's URL
+		// will have been modified by directing the request, overwriting
+		// the unix socket filename.
+		// Also, we need to avoid overwriting the address at this point
+		// when not necessary, because http.ProxyFromEnvironment may have
+		// modified the address according to the user's env proxy config.
+		if dialInfo, ok := GetDialInfo(ctx); ok {
+			if strings.HasPrefix(dialInfo.Network, "unix") {
 				network = dialInfo.Network
 				address = dialInfo.Address
 			}
-			conn, err := dialer.DialContext(ctx, network, address)
+		}
+
+		conn, err := dialer.DialContext(ctx, network, address)
+		if err != nil {
+			// identify this error as one that occurred during
+			// dialing, which can be important when trying to
+			// decide whether to retry a request
+			return nil, DialError{err}
+		}
+
+		if h.ProxyProtocol != "" {
+			proxyProtocolInfo, ok := caddyhttp.GetVar(ctx, proxyProtocolInfoVarKey).(ProxyProtocolInfo)
+			if !ok {
+				return nil, fmt.Errorf("failed to get proxy protocol info from context")
+			}
+			var proxyv byte
+			switch h.ProxyProtocol {
+			case "v1":
+				proxyv = 1
+			case "v2":
+				proxyv = 2
+			default:
+				return nil, fmt.Errorf("unexpected proxy protocol version")
+			}
+
+			// The src and dst have to be of the same address family. As we don't know the original
+			// dst address (it's kind of impossible to know) and this address is generally of very
+			// little interest, we just set it to all zeros.
+			var destAddr net.Addr
+			switch {
+			case proxyProtocolInfo.AddrPort.Addr().Is4():
+				destAddr = &net.TCPAddr{
+					IP: net.IPv4zero,
+				}
+			case proxyProtocolInfo.AddrPort.Addr().Is6():
+				destAddr = &net.TCPAddr{
+					IP: net.IPv6zero,
+				}
+			default:
+				return nil, fmt.Errorf("unexpected remote addr type in proxy protocol info")
+			}
+			sourceAddr := &net.TCPAddr{
+				IP:   proxyProtocolInfo.AddrPort.Addr().AsSlice(),
+				Port: int(proxyProtocolInfo.AddrPort.Port()),
+				Zone: proxyProtocolInfo.AddrPort.Addr().Zone(),
+			}
+			header := proxyproto.HeaderProxyFromAddrs(proxyv, sourceAddr, destAddr)
+
+			// retain the log message structure
+			switch h.ProxyProtocol {
+			case "v1":
+				caddyCtx.Logger().Debug("sending proxy protocol header v1", zap.Any("header", header))
+			case "v2":
+				caddyCtx.Logger().Debug("sending proxy protocol header v2", zap.Any("header", header))
+			}
+
+			_, err = header.WriteTo(conn)
 			if err != nil {
 				// identify this error as one that occurred during
 				// dialing, which can be important when trying to
 				// decide whether to retry a request
 				return nil, DialError{err}
 			}
-			return conn, nil
-		},
+		}
+
+		// if read/write timeouts are configured and this is a TCP connection,
+		// enforce the timeouts by wrapping the connection with our own type
+		if tcpConn, ok := conn.(*net.TCPConn); ok && (h.ReadTimeout > 0 || h.WriteTimeout > 0) {
+			conn = &tcpRWTimeoutConn{
+				TCPConn:      tcpConn,
+				readTimeout:  time.Duration(h.ReadTimeout),
+				writeTimeout: time.Duration(h.WriteTimeout),
+				logger:       caddyCtx.Logger(),
+			}
+		}
+
+		return conn, nil
+	}
+
+	// negotiate any HTTP/SOCKS proxy for the HTTP transport
+	var proxy func(*http.Request) (*url.URL, error)
+	if h.ForwardProxyURL != "" {
+		pUrl, err := url.Parse(h.ForwardProxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse transport proxy url: %v", err)
+		}
+		caddyCtx.Logger().Info("setting transport proxy url", zap.String("url", h.ForwardProxyURL))
+		proxy = http.ProxyURL(pUrl)
+	} else {
+		proxy = http.ProxyFromEnvironment
+	}
+
+	rt := &http.Transport{
+		Proxy:                  proxy,
+		DialContext:            dialContext,
 		MaxConnsPerHost:        h.MaxConnsPerHost,
 		ResponseHeaderTimeout:  time.Duration(h.ResponseHeaderTimeout),
 		ExpectContinueTimeout:  time.Duration(h.ExpectContinueTimeout),
@@ -214,7 +354,7 @@ func (h *HTTPTransport) NewTransport(ctx caddy.Context) (*http.Transport, error)
 	if h.TLS != nil {
 		rt.TLSHandshakeTimeout = time.Duration(h.TLS.HandshakeTimeout)
 		var err error
-		rt.TLSClientConfig, err = h.TLS.MakeTLSClientConfig(ctx)
+		rt.TLSClientConfig, err = h.TLS.MakeTLSClientConfig(caddyCtx)
 		if err != nil {
 			return nil, fmt.Errorf("making TLS client config: %v", err)
 		}
@@ -230,14 +370,60 @@ func (h *HTTPTransport) NewTransport(ctx caddy.Context) (*http.Transport, error)
 		rt.IdleConnTimeout = time.Duration(h.KeepAlive.IdleConnTimeout)
 	}
 
+	// The proxy protocol header can only be sent once right after opening the connection.
+	// So single connection must not be used for multiple requests, which can potentially
+	// come from different clients.
+	if !rt.DisableKeepAlives && h.ProxyProtocol != "" {
+		caddyCtx.Logger().Warn("disabling keepalives, they are incompatible with using PROXY protocol")
+		rt.DisableKeepAlives = true
+	}
+
 	if h.Compression != nil {
 		rt.DisableCompression = !*h.Compression
 	}
 
-	if sliceContains(h.Versions, "2") {
+	if slices.Contains(h.Versions, "2") {
 		if err := http2.ConfigureTransport(rt); err != nil {
 			return nil, err
 		}
+	}
+
+	// configure HTTP/3 transport if enabled; however, this does not
+	// automatically fall back to lower versions like most web browsers
+	// do (that'd add latency and complexity, besides, we expect that
+	// site owners  control the backends), so it must be exclusive
+	if len(h.Versions) == 1 && h.Versions[0] == "3" {
+		h.h3Transport = new(http3.Transport)
+		if h.TLS != nil {
+			var err error
+			h.h3Transport.TLSClientConfig, err = h.TLS.MakeTLSClientConfig(caddyCtx)
+			if err != nil {
+				return nil, fmt.Errorf("making TLS client config for HTTP/3 transport: %v", err)
+			}
+		}
+	} else if len(h.Versions) > 1 && slices.Contains(h.Versions, "3") {
+		return nil, fmt.Errorf("if HTTP/3 is enabled to the upstream, no other HTTP versions are supported")
+	}
+
+	// if h2c is enabled, configure its transport (std lib http.Transport
+	// does not "HTTP/2 over cleartext TCP")
+	if slices.Contains(h.Versions, "h2c") {
+		// crafting our own http2.Transport doesn't allow us to utilize
+		// most of the customizations/preferences on the http.Transport,
+		// because, for some reason, only http2.ConfigureTransport()
+		// is allowed to set the unexported field that refers to a base
+		// http.Transport config; oh well
+		h2t := &http2.Transport{
+			// kind of a hack, but for plaintext/H2C requests, pretend to dial TLS
+			DialTLSContext: func(ctx context.Context, network, address string, _ *tls.Config) (net.Conn, error) {
+				return dialContext(ctx, network, address)
+			},
+			AllowHTTP: true,
+		}
+		if h.Compression != nil {
+			h2t.DisableCompression = !*h.Compression
+		}
+		h.h2cTransport = h2t
 	}
 
 	return rt, nil
@@ -283,9 +469,17 @@ func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	transport.SetScheme(req)
 
+	// use HTTP/3 if enabled (TODO: This is EXPERIMENTAL)
+	if h.h3Transport != nil {
+		return h.h3Transport.RoundTrip(req)
+	}
+
 	// if H2C ("HTTP/2 over cleartext") is enabled and the upstream request is
 	// HTTP without TLS, use the alternate H2C-capable transport instead
 	if req.URL.Scheme == "http" && h.h2cTransport != nil {
+		// There is no dedicated DisableKeepAlives field in *http2.Transport.
+		// This is an alternative way to disable keep-alive.
+		req.Close = h.Transport.DisableKeepAlives
 		return h.h2cTransport.RoundTrip(req)
 	}
 
@@ -348,9 +542,14 @@ func (h HTTPTransport) Cleanup() error {
 // TLSConfig holds configuration related to the TLS configuration for the
 // transport/client.
 type TLSConfig struct {
+	// Certificate authority module which provides the certificate pool of trusted certificates
+	CARaw json.RawMessage `json:"ca,omitempty" caddy:"namespace=tls.ca_pool.source inline_key=provider"`
+
+	// Deprecated: Use the `ca` field with the `tls.ca_pool.source.inline` module instead.
 	// Optional list of base64-encoded DER-encoded CA certificates to trust.
 	RootCAPool []string `json:"root_ca_pool,omitempty"`
 
+	// Deprecated: Use the `ca` field with the `tls.ca_pool.source.file` module instead.
 	// List of PEM-encoded CA certificate files to add to the same trust
 	// store as RootCAPool (or root_ca_pool in the JSON).
 	RootCAPEMFiles []string `json:"root_ca_pem_files,omitempty"`
@@ -397,11 +596,15 @@ type TLSConfig struct {
 	// When specified, TLS will automatically be configured on the transport.
 	// The value can be a list of any valid tcp port numbers, default empty.
 	ExceptPorts []string `json:"except_ports,omitempty"`
+
+	// The list of elliptic curves to support. Caddy's
+	// defaults are modern and secure.
+	Curves []string `json:"curves,omitempty"`
 }
 
 // MakeTLSClientConfig returns a tls.Config usable by a client to a backend.
 // If there is no custom TLS configuration, a nil config may be returned.
-func (t TLSConfig) MakeTLSClientConfig(ctx caddy.Context) (*tls.Config, error) {
+func (t *TLSConfig) MakeTLSClientConfig(ctx caddy.Context) (*tls.Config, error) {
 	cfg := new(tls.Config)
 
 	// client auth
@@ -430,10 +633,11 @@ func (t TLSConfig) MakeTLSClientConfig(ctx caddy.Context) (*tls.Config, error) {
 			return nil, fmt.Errorf("managing client certificate: %v", err)
 		}
 		cfg.GetClientCertificate = func(cri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-			certs := tlsApp.AllMatchingCertificates(t.ClientCertificateAutomate)
+			certs := caddytls.AllMatchingCertificates(t.ClientCertificateAutomate)
 			var err error
 			for _, cert := range certs {
-				err = cri.SupportsCertificate(&cert.Certificate)
+				certCertificate := cert.Certificate // avoid taking address of iteration variable (gosec warning)
+				err = cri.SupportsCertificate(&certCertificate)
 				if err == nil {
 					return &cert.Certificate, nil
 				}
@@ -447,6 +651,7 @@ func (t TLSConfig) MakeTLSClientConfig(ctx caddy.Context) (*tls.Config, error) {
 
 	// trusted root CAs
 	if len(t.RootCAPool) > 0 || len(t.RootCAPEMFiles) > 0 {
+		ctx.Logger().Warn("root_ca_pool and root_ca_pem_files are deprecated. Use one of the tls.ca_pool.source modules instead")
 		rootPool := x509.NewCertPool()
 		for _, encodedCACert := range t.RootCAPool {
 			caCert, err := decodeBase64DERCert(encodedCACert)
@@ -461,9 +666,23 @@ func (t TLSConfig) MakeTLSClientConfig(ctx caddy.Context) (*tls.Config, error) {
 				return nil, fmt.Errorf("failed reading ca cert: %v", err)
 			}
 			rootPool.AppendCertsFromPEM(pemData)
-
 		}
 		cfg.RootCAs = rootPool
+	}
+
+	if t.CARaw != nil {
+		if len(t.RootCAPool) > 0 || len(t.RootCAPEMFiles) > 0 {
+			return nil, fmt.Errorf("conflicting config for Root CA pool")
+		}
+		caRaw, err := ctx.LoadModule(t, "CARaw")
+		if err != nil {
+			return nil, fmt.Errorf("failed to load ca module: %v", err)
+		}
+		ca, ok := caRaw.(caddytls.CA)
+		if !ok {
+			return nil, fmt.Errorf("CA module '%s' is not a certificate pool provider", ca)
+		}
+		cfg.RootCAs = ca.CertPool()
 	}
 
 	// Renegotiation
@@ -483,6 +702,15 @@ func (t TLSConfig) MakeTLSClientConfig(ctx caddy.Context) (*tls.Config, error) {
 
 	// throw all security out the window
 	cfg.InsecureSkipVerify = t.InsecureSkipVerify
+
+	curvesAdded := make(map[tls.CurveID]struct{})
+	for _, curveName := range t.Curves {
+		curveID := caddytls.SupportedCurves[curveName]
+		if _, ok := curvesAdded[curveID]; !ok {
+			curvesAdded[curveID] = struct{}{}
+			cfg.CurvePreferences = append(cfg.CurvePreferences, curveID)
+		}
+	}
 
 	// only return a config if it's not empty
 	if reflect.DeepEqual(cfg, new(tls.Config)) {
@@ -510,6 +738,40 @@ type KeepAlive struct {
 	IdleConnTimeout caddy.Duration `json:"idle_timeout,omitempty"`
 }
 
+// tcpRWTimeoutConn enforces read/write timeouts for a TCP connection.
+// If it fails to set deadlines, the error is logged but does not abort
+// the read/write attempt (ignoring the error is consistent with what
+// the standard library does: https://github.com/golang/go/blob/c5da4fb7ac5cb7434b41fc9a1df3bee66c7f1a4d/src/net/http/server.go#L981-L986)
+type tcpRWTimeoutConn struct {
+	*net.TCPConn
+	readTimeout, writeTimeout time.Duration
+	logger                    *zap.Logger
+}
+
+func (c *tcpRWTimeoutConn) Read(b []byte) (int, error) {
+	if c.readTimeout > 0 {
+		err := c.TCPConn.SetReadDeadline(time.Now().Add(c.readTimeout))
+		if err != nil {
+			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set read deadline"); ce != nil {
+				ce.Write(zap.Error(err))
+			}
+		}
+	}
+	return c.TCPConn.Read(b)
+}
+
+func (c *tcpRWTimeoutConn) Write(b []byte) (int, error) {
+	if c.writeTimeout > 0 {
+		err := c.TCPConn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+		if err != nil {
+			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set write deadline"); ce != nil {
+				ce.Write(zap.Error(err))
+			}
+		}
+	}
+	return c.TCPConn.Write(b)
+}
+
 // decodeBase64DERCert base64-decodes, then DER-decodes, certStr.
 func decodeBase64DERCert(certStr string) (*x509.Certificate, error) {
 	// decode base64
@@ -520,16 +782,6 @@ func decodeBase64DERCert(certStr string) (*x509.Certificate, error) {
 
 	// parse the DER-encoded certificate
 	return x509.ParseCertificate(derBytes)
-}
-
-// sliceContains returns true if needle is in haystack.
-func sliceContains(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
-		}
-	}
-	return false
 }
 
 // Interface guards

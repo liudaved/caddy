@@ -17,6 +17,7 @@ package forwardauth
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
@@ -38,29 +39,28 @@ func init() {
 // configured for most™️ auth gateways that support forward auth. The typical
 // config which looks something like this:
 //
-//     forward_auth auth-gateway:9091 {
-//         uri /authenticate?redirect=https://auth.example.com
-//         copy_headers Remote-User Remote-Email
-//     }
+//	forward_auth auth-gateway:9091 {
+//	    uri /authenticate?redirect=https://auth.example.com
+//	    copy_headers Remote-User Remote-Email
+//	}
 //
 // is equivalent to a reverse_proxy directive like this:
 //
-//     reverse_proxy auth-gateway:9091 {
-//         method GET
-//         rewrite /authenticate?redirect=https://auth.example.com
+//	reverse_proxy auth-gateway:9091 {
+//	    method GET
+//	    rewrite /authenticate?redirect=https://auth.example.com
 //
-//         header_up X-Forwarded-Method {method}
-//         header_up X-Forwarded-Uri {uri}
+//	    header_up X-Forwarded-Method {method}
+//	    header_up X-Forwarded-Uri {uri}
 //
-//         @good status 2xx
-//         handle_response @good {
-//             request_header {
-//                 Remote-User {http.reverse_proxy.header.Remote-User}
-//                 Remote-Email {http.reverse_proxy.header.Remote-Email}
-//             }
-//         }
-//     }
-//
+//	    @good status 2xx
+//	    handle_response @good {
+//	        request_header {
+//	            Remote-User {http.reverse_proxy.header.Remote-User}
+//	            Remote-Email {http.reverse_proxy.header.Remote-Email}
+//	        }
+//	    }
+//	}
 func parseCaddyfile(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error) {
 	if !h.Next() {
 		return nil, h.ArgErr()
@@ -130,8 +130,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error)
 					return nil, dispenser.ArgErr()
 				}
 				rpHandler.Rewrite.URI = dispenser.Val()
-				dispenser.Delete()
-				dispenser.Delete()
+				dispenser.DeleteN(2)
 
 			case "copy_headers":
 				args := dispenser.RemainingArgs()
@@ -141,13 +140,11 @@ func parseCaddyfile(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error)
 					args = append(args, dispenser.Val())
 				}
 
-				dispenser.Delete() // directive name
+				// directive name + args
+				dispenser.DeleteN(len(args) + 1)
 				if hadBlock {
-					dispenser.Delete() // opening brace
-					dispenser.Delete() // closing brace
-				}
-				for range args {
-					dispenser.Delete()
+					// opening & closing brace
+					dispenser.DeleteN(2)
 				}
 
 				for _, headerField := range args {
@@ -174,44 +171,66 @@ func parseCaddyfile(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error)
 		return nil, dispenser.Errf("the 'uri' subdirective is required")
 	}
 
-	// set up handler for good responses; when a response
-	// has 2xx status, then we will copy some headers from
-	// the response onto the original request, and allow
-	// handling to continue down the middleware chain,
-	// by _not_ executing a terminal handler.
+	// Set up handler for good responses; when a response has 2xx status,
+	// then we will copy some headers from the response onto the original
+	// request, and allow handling to continue down the middleware chain,
+	// by _not_ executing a terminal handler. We must have at least one
+	// route in the response handler, even if it's no-op, so that the
+	// response handling logic in reverse_proxy doesn't skip this entry.
 	goodResponseHandler := caddyhttp.ResponseHandler{
 		Match: &caddyhttp.ResponseMatcher{
 			StatusCode: []int{2},
 		},
-		Routes: []caddyhttp.Route{},
-	}
-
-	handler := &headers.Handler{
-		Request: &headers.HeaderOps{
-			Set: http.Header{},
+		Routes: []caddyhttp.Route{
+			{
+				HandlersRaw: []json.RawMessage{caddyconfig.JSONModuleObject(
+					&caddyhttp.VarsMiddleware{},
+					"handler",
+					"vars",
+					nil,
+				)},
+			},
 		},
 	}
 
-	// the list of headers to copy may be empty, but that's okay; we
-	// need at least one handler in the routes for the response handling
-	// logic in reverse_proxy to not skip this entry as empty.
-	for from, to := range headersToCopy {
-		handler.Request.Set[to] = []string{
-			"{http.reverse_proxy.header." + from + "}",
-		}
+	// Sort the headers so that the order in the JSON output is deterministic.
+	sortedHeadersToCopy := make([]string, 0, len(headersToCopy))
+	for k := range headersToCopy {
+		sortedHeadersToCopy = append(sortedHeadersToCopy, k)
 	}
+	sort.Strings(sortedHeadersToCopy)
 
-	goodResponseHandler.Routes = append(
-		goodResponseHandler.Routes,
-		caddyhttp.Route{
+	// Set up handlers to copy headers from the auth response onto the
+	// original request. We use vars matchers to test that the placeholder
+	// values aren't empty, because the header handler would not replace
+	// placeholders which have no value.
+	copyHeaderRoutes := []caddyhttp.Route{}
+	for _, from := range sortedHeadersToCopy {
+		to := http.CanonicalHeaderKey(headersToCopy[from])
+		placeholderName := "http.reverse_proxy.header." + http.CanonicalHeaderKey(from)
+		handler := &headers.Handler{
+			Request: &headers.HeaderOps{
+				Set: http.Header{
+					to: []string{"{" + placeholderName + "}"},
+				},
+			},
+		}
+		copyHeaderRoutes = append(copyHeaderRoutes, caddyhttp.Route{
+			MatcherSetsRaw: []caddy.ModuleMap{{
+				"not": h.JSON(caddyhttp.MatchNot{MatcherSetsRaw: []caddy.ModuleMap{{
+					"vars": h.JSON(caddyhttp.VarsMatcher{"{" + placeholderName + "}": []string{""}}),
+				}}}),
+			}},
 			HandlersRaw: []json.RawMessage{caddyconfig.JSONModuleObject(
 				handler,
 				"handler",
 				"headers",
 				nil,
 			)},
-		},
-	)
+		})
+	}
+
+	goodResponseHandler.Routes = append(goodResponseHandler.Routes, copyHeaderRoutes...)
 
 	// note that when a response has any other status than 2xx, then we
 	// use the reverse proxy's default behaviour of copying the response
@@ -222,6 +241,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error)
 
 	// the rest of the config is specified by the user
 	// using the reverse_proxy directive syntax
+	dispenser.Next() // consume the directive name
 	err = rpHandler.UnmarshalCaddyfile(dispenser)
 	if err != nil {
 		return nil, err

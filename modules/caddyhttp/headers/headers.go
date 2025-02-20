@@ -135,13 +135,14 @@ type HeaderOps struct {
 func (ops *HeaderOps) Provision(_ caddy.Context) error {
 	for fieldName, replacements := range ops.Replace {
 		for i, r := range replacements {
-			if r.SearchRegexp != "" {
-				re, err := regexp.Compile(r.SearchRegexp)
-				if err != nil {
-					return fmt.Errorf("replacement %d for header field '%s': %v", i, fieldName, err)
-				}
-				replacements[i].re = re
+			if r.SearchRegexp == "" {
+				continue
 			}
+			re, err := regexp.Compile(r.SearchRegexp)
+			if err != nil {
+				return fmt.Errorf("replacement %d for header field '%s': %v", i, fieldName, err)
+			}
+			replacements[i].re = re
 		}
 	}
 	return nil
@@ -184,7 +185,7 @@ type RespHeaderOps struct {
 	Require *caddyhttp.ResponseMatcher `json:"require,omitempty"`
 
 	// If true, header operations will be deferred until
-	// they are written out. Superceded if Require is set.
+	// they are written out. Superseded if Require is set.
 	// Usually you will need to set this to true if any
 	// fields are being deleted.
 	Deferred bool `json:"deferred,omitempty"`
@@ -192,6 +193,17 @@ type RespHeaderOps struct {
 
 // ApplyTo applies ops to hdr using repl.
 func (ops HeaderOps) ApplyTo(hdr http.Header, repl *caddy.Replacer) {
+	// before manipulating headers in other ways, check if there
+	// is configuration to delete all headers, and do that first
+	// because if a header is to be added, we don't want to delete
+	// it also
+	for _, fieldName := range ops.Delete {
+		fieldName = repl.ReplaceKnown(fieldName, "")
+		if fieldName == "*" {
+			clear(hdr)
+		}
+	}
+
 	// add
 	for fieldName, vals := range ops.Add {
 		fieldName = repl.ReplaceKnown(fieldName, "")
@@ -215,6 +227,9 @@ func (ops HeaderOps) ApplyTo(hdr http.Header, repl *caddy.Replacer) {
 	// delete
 	for _, fieldName := range ops.Delete {
 		fieldName = strings.ToLower(repl.ReplaceKnown(fieldName, ""))
+		if fieldName == "*" {
+			continue // handled above
+		}
 		switch {
 		case strings.HasPrefix(fieldName, "*") && strings.HasSuffix(fieldName, "*"):
 			for existingField := range hdr {
@@ -332,7 +347,10 @@ func (rww *responseWriterWrapper) WriteHeader(status int) {
 	if rww.wroteHeader {
 		return
 	}
-	rww.wroteHeader = true
+	// 1xx responses aren't final; just informational
+	if status < 100 || status > 199 {
+		rww.wroteHeader = true
+	}
 	if rww.require == nil || rww.require.Match(status, rww.ResponseWriterWrapper.Header()) {
 		if rww.headerOps != nil {
 			rww.headerOps.ApplyTo(rww.ResponseWriterWrapper.Header(), rww.replacer)
@@ -352,5 +370,5 @@ func (rww *responseWriterWrapper) Write(d []byte) (int, error) {
 var (
 	_ caddy.Provisioner           = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
-	_ caddyhttp.HTTPInterfaces    = (*responseWriterWrapper)(nil)
+	_ http.ResponseWriter         = (*responseWriterWrapper)(nil)
 )
